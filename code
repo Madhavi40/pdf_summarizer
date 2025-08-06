@@ -1,0 +1,127 @@
+import streamlit as st
+import tempfile
+import os
+import shutil
+from PyPDF2 import PdfReader
+from langchain_community.embeddings import BedrockEmbeddings
+from langchain_community.vectorstores import Chroma
+from langchain.chains import RetrievalQA
+from langchain.prompts import PromptTemplate
+from langchain_community.chat_models import BedrockChat
+import time
+
+
+# --- CONFIGURATION ---
+def get_bedrock_llm():
+    return BedrockChat(
+        model_id="anthropic.claude-3-5-sonnet-20240620-v1:0",
+        model_kwargs={
+            "temperature": 0.7,
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": 1000
+        },
+    )
+
+def get_titan_embeddings():
+    return BedrockEmbeddings(
+        model_id="amazon.titan-embed-text-v2:0"
+    )
+
+# --- PDF PROCESSING ---
+def extract_text_from_pdf(pdf_file):
+    reader = PdfReader(pdf_file)
+    text = ""
+    for page in reader.pages:
+        text += page.extract_text() or ""
+    return text
+
+# --- RAG WITH CHROMADB ---
+def build_retriever(pdf_text, embeddings, chroma_dir):
+    vectordb = Chroma.from_texts(
+        texts=[pdf_text],
+        embedding=embeddings,
+        persist_directory=chroma_dir
+    )
+    retriever = vectordb.as_retriever(search_kwargs={"k": 3})
+    return retriever, vectordb
+
+# --- SUMMARIZATION CHAIN ---
+def summarize_pdf(pdf_name, pdf_text, llm, embeddings, chroma_dir):
+    retriever, vectordb = build_retriever(pdf_text, embeddings, chroma_dir)
+    prompt = PromptTemplate(
+        input_variables=["context"],
+        template=(
+            "You are an expert document summarizer. Given the following context, "
+            "write a concise summary of about 200 words.\n\n"
+            "Context:\n{context}\n\n"
+            "Format your output as a summary paragraph."
+        )
+    )
+    chain = RetrievalQA.from_chain_type(
+        llm=llm,
+        retriever=retriever,
+        chain_type="stuff",
+        return_source_documents=False,
+        chain_type_kwargs={"prompt": prompt}
+    )
+    result = chain({"query": "Summarize this document in about 200 words."})
+    summary_text = result['result']
+    yaml_output = (
+        f"PDF Name: {pdf_name}\n"
+        # f"Title of PDF: {pdf_title}\n"
+        f"Summary: |\n  {summary_text.replace(chr(10), chr(10) + '  ')}\n"
+    )
+    del vectordb  # ensure file handles are released
+    return yaml_output
+
+# --- STREAMLIT APP ---
+st.set_page_config(page_title="PDF Summary Generator", layout="centered")
+st.title("📄 PDF Summary Generator")
+
+st.write(
+    "Upload 1–5 PDF files. Each will be summarized using AI with retrieval-augmented generation. "
+    "Summaries are about 200 words each and downloadable as `.txt` files."
+)
+
+uploaded_files = st.file_uploader(
+    "Attach up to 5 PDF files",
+    type=["pdf"],
+    accept_multiple_files=True,
+    help="Only PDF files are supported."
+)
+
+if uploaded_files:
+    non_pdfs = [f for f in uploaded_files if not f.name.lower().endswith('.pdf')]
+    if non_pdfs:
+        st.error("Attach only PDF files.")
+    elif len(uploaded_files) > 5:
+        st.error("You can upload a maximum of 5 PDF files.")
+    else:
+        llm = get_bedrock_llm()
+        embeddings = get_titan_embeddings()
+        summaries = []
+        for pdf_file in uploaded_files:
+            with st.spinner(f"Processing {pdf_file.name}..."):
+                text = extract_text_from_pdf(pdf_file)
+                # title = get_pdf_title(pdf_file)
+                # Use a unique temp directory per PDF
+                chroma_dir = os.path.join(tempfile.gettempdir(), f"chroma_{os.path.splitext(pdf_file.name)[0]}")
+                os.makedirs(chroma_dir, exist_ok=True)
+                # summary = summarize_pdf(pdf_file.name, title, text, llm, embeddings, chroma_dir)
+                summary = summarize_pdf(pdf_file.name, text, llm, embeddings, chroma_dir)
+                summaries.append((pdf_file.name, summary))
+                # Clean up Chroma directory
+                shutil.rmtree(chroma_dir, ignore_errors=True)
+                time.sleep(70)  # <-- Add this line to wait 15 seconds between requests
+
+        for pdf_name, summary in summaries:
+            st.subheader(f"Summary for: {pdf_name}")
+            st.code(summary, language="yaml")
+            st.download_button(
+                label="Download Summary (.txt)",
+                data=summary,
+                file_name=f"{os.path.splitext(pdf_name)[0]}_summary.txt",
+                mime="text/plain"
+            )
+else:
+    st.info("Please upload 1–5 PDF files to begin.")
